@@ -5,7 +5,10 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from groq import Groq
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from dateutil import parser as dateparser
+
+TZ_MADRID = ZoneInfo("Europe/Madrid")
 
 # Módulos nuevos
 from pdf_context import load_company_context
@@ -189,6 +192,11 @@ def handle_agendar(svc, mid, tid, sender, subject, decision):
 
     try:
         fecha_dt = dateparser.parse(fecha_str)
+        if fecha_dt is None:
+            raise ValueError("dateparser devolvió None")
+        # Forzar siempre zona horaria Europe/Madrid
+        fecha_dt = fecha_dt.replace(tzinfo=None)
+        fecha_dt = fecha_dt.replace(tzinfo=TZ_MADRID)
     except Exception as e:
         logger.error(f"❌ No se pudo parsear la fecha '{fecha_str}': {e}. Escalando.")
         mark_starred(svc, mid)
