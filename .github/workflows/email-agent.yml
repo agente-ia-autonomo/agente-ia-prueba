@@ -8,6 +8,8 @@ on:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout código
         uses: actions/checkout@v4
@@ -29,3 +31,12 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
         run: python email_agent.py
+
+      - name: Keep-alive commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo $(date) > .last_run
+          git add .last_run
+          git commit -m "chore: keep-alive $(date +'%Y-%m-%d %H:%M')" || echo "Sin cambios"
+          git push
