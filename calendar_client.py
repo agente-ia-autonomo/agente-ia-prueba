@@ -73,6 +73,75 @@ def slot_disponible(fecha_hora: datetime) -> bool:
         return False
 
 
+def buscar_slots_libres(fecha_hora_referencia: datetime, num_slots: int = 3) -> list[datetime]:
+    """
+    Busca `num_slots` franjas horarias libres próximas a `fecha_hora_referencia`.
+    Busca hacia adelante y hacia atrás en bloques de 1 hora,
+    respetando el horario de atención 09:30–17:00 de lunes a viernes.
+    """
+    HORA_INICIO = 9   # 09:30
+    MIN_INICIO  = 30
+    HORA_FIN    = 17  # 17:00
+
+    candidatos: list[datetime] = []
+    visitados: set[str] = set()
+
+    pasos_adelante = 0
+    pasos_atras    = 0
+    max_dias       = 14  # límite de búsqueda
+
+    while len(candidatos) < num_slots:
+        for delta_horas in [pasos_adelante + 1, -(pasos_atras + 1)]:
+            if len(candidatos) >= num_slots:
+                break
+
+            candidato = fecha_hora_referencia + timedelta(hours=delta_horas)
+
+            # Solo horario laboral (lun–vie, 09:30–17:00)
+            if candidato.weekday() >= 5:  # sáb / dom
+                if delta_horas > 0:
+                    pasos_adelante += 1
+                else:
+                    pasos_atras += 1
+                continue
+
+            if not (
+                (candidato.hour > HORA_INICIO or (candidato.hour == HORA_INICIO and candidato.minute >= MIN_INICIO))
+                and candidato.hour < HORA_FIN
+            ):
+                if delta_horas > 0:
+                    pasos_adelante += 1
+                else:
+                    pasos_atras += 1
+                continue
+
+            # Redondear a la hora en punto más cercana
+            candidato = candidato.replace(minute=0, second=0, microsecond=0)
+
+            clave = candidato.isoformat()
+            if clave in visitados:
+                if delta_horas > 0:
+                    pasos_adelante += 1
+                else:
+                    pasos_atras += 1
+                continue
+            visitados.add(clave)
+
+            if slot_disponible(candidato):
+                candidatos.append(candidato)
+                logger.info(f"🟢 Slot libre encontrado: {candidato}")
+
+        pasos_adelante += 1
+        pasos_atras    += 1
+
+        # Seguridad: no buscar más de max_dias
+        if pasos_adelante > max_dias * 24:
+            logger.warning("⚠️ Se alcanzó el límite de búsqueda de slots libres.")
+            break
+
+    return candidatos[:num_slots]
+
+
 def agendar_cita(fecha_hora: datetime, email_cliente: str, asunto_email: str) -> str | None:
     if not slot_disponible(fecha_hora):
         logger.warning(f"⛔ No se puede agendar: slot ocupado en {fecha_hora}")
