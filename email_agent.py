@@ -196,9 +196,19 @@ def handle_agendar(svc, mid, tid, sender, subject, decision):
         mark_read(svc, mid)
         logger.info(f"📅 Cita agendada y confirmada: {subject[:60]}")
     else:
-        # Si Calendar falla, escalamos en lugar de responder
-        logger.error("❌ Fallo al crear evento en Calendar. Escalando.")
-        mark_starred(svc, mid)
+        else:
+        logger.warning("⛔ Slot ocupado. Notificando al cliente.")
+        mensaje_ocupado = (
+            f"Hola,\n\n"
+            f"Gracias por contactarnos. Lamentablemente el horario solicitado "
+            f"({fecha_dt.strftime('%d/%m/%Y a las %H:%M')}) no está disponible "
+            f"ya que tenemos otra cita en ese rango horario.\n\n"
+            f"Por favor, indícanos otro horario de tu preferencia y lo agendamos "
+            f"sin problema.\n\nRecuerda que atendemos todos los días de 9:30 a 17:00.\n\n"
+            f"Un saludo,\n{COMPANY}"
+        )
+        send_reply(svc, mid, tid, sender, subject, mensaje_ocupado)
+        mark_read(svc, mid)
 
 
 def handle_cancelar(svc, mid, tid, sender, subject, decision):
@@ -297,3 +307,4 @@ def process_new_emails():
 
 if __name__ == "__main__":
     process_new_emails()
+
