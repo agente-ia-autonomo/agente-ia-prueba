@@ -4,6 +4,12 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from groq import Groq
+from dateutil import parser as dateparser
+
+# Módulos nuevos
+from pdf_context import load_company_context
+from supabase_client import guardar_cita, obtener_ultimo_event_id, eliminar_cita
+from calendar_client import agendar_cita, cancelar_cita
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -12,16 +18,30 @@ logger = logging.getLogger(__name__)
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 COMPANY = os.environ.get("COMPANY_NAME", "Nuestra Empresa")
 
+# ── Contexto de empresa desde PDF ─────────────────────────────────────────────
+COMPANY_CONTEXT = load_company_context()
+CONTEXT_BLOCK = (
+    f"\n\n---\nDOCUMENTACIÓN DE LA EMPRESA (usa esto para responder preguntas sobre servicios):\n{COMPANY_CONTEXT}\n---"
+    if COMPANY_CONTEXT else ""
+)
+
 SYSTEM_PROMPT = f"""Eres el asistente de atención al cliente de {COMPANY}.
-Analiza el email y responde SOLO con JSON válido (sin markdown):
+{CONTEXT_BLOCK}
+
+Analiza el email y responde SOLO con JSON válido (sin markdown, sin texto extra):
 {{
-  "action": "respond" o "escalate",
-  "reason": "motivo en una frase",
-  "reply_message": "respuesta al cliente si respond, vacío si escalate"
+  "accion": "AGENDAR" | "CANCELAR" | "RESPONDER" | "ESCALAR",
+  "fecha_hora": "YYYY-MM-DDTHH:MM:SS" (solo si accion es AGENDAR, si no: null),
+  "respuesta_texto": "Texto completo para el cuerpo del correo al cliente"
 }}
 
-respond → preguntas simples, FAQs, info general
-escalate → quejas, temas complejos, cliente lo pide, incertidumbre"""
+Reglas de decisión:
+- AGENDAR  → el cliente pide una cita, reunión o llamada con fecha/hora concreta
+- CANCELAR → el cliente quiere cancelar o anular una cita existente
+- RESPONDER → preguntas simples, FAQs, info sobre servicios (usa la documentación)
+- ESCALAR  → quejas, temas legales, situaciones complejas o dudas sin respuesta en la documentación
+
+Si la fecha/hora no está clara para AGENDAR, usa ESCALAR en su lugar."""
 
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -32,7 +52,7 @@ GMAIL_SCOPES = [
 BOT_LABEL = "bot-processed"
 
 
-# ── FIX #1: Credenciales robustas ─────────────────────────────────────────────
+# ── Autenticación Gmail ────────────────────────────────────────────────────────
 def get_gmail_service():
     creds_data = json.loads(os.environ["GMAIL_CREDENTIALS_JSON"])
     creds = Credentials(
@@ -43,7 +63,6 @@ def get_gmail_service():
         client_secret=creds_data.get("client_secret"),
         scopes=GMAIL_SCOPES,
     )
-    # FIX: usar creds.valid en lugar de solo creds.expired
     if not creds.valid:
         if creds.refresh_token:
             creds.refresh(Request())
@@ -52,7 +71,7 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
-# ── Obtener o crear el label en Gmail ─────────────────────────────────────────
+# ── Label bot-processed ────────────────────────────────────────────────────────
 def get_or_create_label(svc):
     labels = svc.users().labels().list(userId="me").execute().get("labels", [])
     for l in labels:
@@ -65,7 +84,7 @@ def get_or_create_label(svc):
     return created["id"]
 
 
-# ── FIX #2: get_body recursivo para emails anidados ───────────────────────────
+# ── Extracción de cuerpo del email ─────────────────────────────────────────────
 def get_body(payload):
     """Extrae texto plano de forma recursiva para soportar estructuras MIME anidadas."""
     mime = payload.get("mimeType", "")
@@ -83,10 +102,9 @@ def get_body(payload):
     return ""
 
 
-# ── FIX #3: send_reply con subject codificado correctamente ───────────────────
+# ── Envío de respuesta ─────────────────────────────────────────────────────────
 def send_reply(svc, mid, tid, to, subject, text):
     reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-    # Codificar subject para soportar tildes, emojis, etc.
     encoded_subject = Header(reply_subject, "utf-8").encode()
 
     msg = (
@@ -124,7 +142,7 @@ def mark_bot_processed(svc, mid, label_id):
     ).execute()
 
 
-# ── FIX #4: Análisis con Groq con retry y backoff ─────────────────────────────
+# ── Análisis con Groq/LLaMA ────────────────────────────────────────────────────
 def analyze(subject, sender, body, retries=3, backoff=5):
     last_error = None
     for attempt in range(retries):
@@ -152,6 +170,79 @@ def analyze(subject, sender, body, retries=3, backoff=5):
     raise last_error
 
 
+# ── Manejadores de cada acción ─────────────────────────────────────────────────
+def handle_agendar(svc, mid, tid, sender, subject, decision):
+    """Agenda la cita en Calendar, guarda en Supabase y responde al cliente."""
+    fecha_str = decision.get("fecha_hora")
+    respuesta = decision.get("respuesta_texto", "")
+
+    if not fecha_str:
+        logger.warning("⚠️ AGENDAR sin fecha_hora. Escalando.")
+        mark_starred(svc, mid)
+        return
+
+    try:
+        fecha_dt = dateparser.parse(fecha_str)
+    except Exception as e:
+        logger.error(f"❌ No se pudo parsear la fecha '{fecha_str}': {e}. Escalando.")
+        mark_starred(svc, mid)
+        return
+
+    event_id = agendar_cita(fecha_dt, sender, subject)
+
+    if event_id:
+        guardar_cita(email=sender, event_id=event_id, fecha_cita=fecha_dt)
+        send_reply(svc, mid, tid, sender, subject, respuesta)
+        mark_read(svc, mid)
+        logger.info(f"📅 Cita agendada y confirmada: {subject[:60]}")
+    else:
+        # Si Calendar falla, escalamos en lugar de responder
+        logger.error("❌ Fallo al crear evento en Calendar. Escalando.")
+        mark_starred(svc, mid)
+
+
+def handle_cancelar(svc, mid, tid, sender, subject, decision):
+    """Busca el event_id en Supabase, cancela en Calendar y responde al cliente."""
+    respuesta = decision.get("respuesta_texto", "")
+
+    event_id = obtener_ultimo_event_id(sender)
+
+    if not event_id:
+        # No hay cita registrada → escalamos para revisión manual
+        logger.warning(f"⚠️ No se encontró cita para cancelar: {sender}. Escalando.")
+        mark_starred(svc, mid)
+        return
+
+    cancelado = cancelar_cita(event_id)
+
+    if cancelado:
+        eliminar_cita(email=sender, event_id=event_id)
+        send_reply(svc, mid, tid, sender, subject, respuesta)
+        mark_read(svc, mid)
+        logger.info(f"🗑️ Cita cancelada y confirmada: {subject[:60]}")
+    else:
+        logger.error("❌ Fallo al cancelar evento en Calendar. Escalando.")
+        mark_starred(svc, mid)
+
+
+def handle_responder(svc, mid, tid, sender, subject, decision):
+    """Envía la respuesta directa al cliente."""
+    respuesta = decision.get("respuesta_texto", "")
+    if respuesta:
+        send_reply(svc, mid, tid, sender, subject, respuesta)
+        mark_read(svc, mid)
+        logger.info(f"✅ Respondido: {subject[:60]}")
+    else:
+        logger.warning("⚠️ RESPONDER sin respuesta_texto. Escalando.")
+        mark_starred(svc, mid)
+
+
+def handle_escalar(svc, mid, subject, decision):
+    """Marca con estrella para revisión manual."""
+    mark_starred(svc, mid)
+    logger.info(f"⭐ Escalado: {subject[:60]} | Motivo: {decision.get('respuesta_texto', '?')[:80]}")
+
+
 # ── Procesador principal ───────────────────────────────────────────────────────
 def process_new_emails():
     logger.info("🔍 Revisando emails...")
@@ -159,7 +250,6 @@ def process_new_emails():
     svc = get_gmail_service()
     label_id = get_or_create_label(svc)
 
-    # Solo trae emails UNREAD que NO tengan el label bot-processed
     msgs = svc.users().messages().list(
         userId="me",
         labelIds=["INBOX", "UNREAD"],
@@ -179,21 +269,25 @@ def process_new_emails():
         tid     = msg["threadId"]
 
         try:
-            d = analyze(subject, sender, body)
+            decision = analyze(subject, sender, body)
         except Exception as e:
             logger.error(f"Error Groq tras reintentos: {e}")
-            d = {"action": "escalate", "reason": f"Error IA: {e}", "reply_message": ""}
+            decision = {
+                "accion": "ESCALAR",
+                "fecha_hora": None,
+                "respuesta_texto": f"Error IA: {e}"
+            }
 
-        action = d.get("action", "escalate")
-        reply  = d.get("reply_message", "")
+        accion = decision.get("accion", "ESCALAR").upper()
 
-        if action == "respond" and reply:
-            send_reply(svc, mid, tid, sender, subject, reply)
-            mark_read(svc, mid)
-            logger.info(f"✅ Respondido: {subject[:60]}")
+        if accion == "AGENDAR":
+            handle_agendar(svc, mid, tid, sender, subject, decision)
+        elif accion == "CANCELAR":
+            handle_cancelar(svc, mid, tid, sender, subject, decision)
+        elif accion == "RESPONDER":
+            handle_responder(svc, mid, tid, sender, subject, decision)
         else:
-            mark_starred(svc, mid)
-            logger.info(f"⭐ Escalado: {subject[:60]} | Motivo: {d.get('reason', '?')}")
+            handle_escalar(svc, mid, subject, decision)
 
         mark_bot_processed(svc, mid, label_id)
         new_count += 1
