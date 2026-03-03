@@ -58,8 +58,11 @@ Reglas de decisión:
 
 Si la fecha/hora no está clara para AGENDAR, usa ESCALAR en su lugar.
 
-IMPORTANTE: En respuesta_texto NUNCA escribas el día de la semana (lunes, martes, etc.).
-Usa solo el formato de fecha DD/MM/YYYY. El sistema insertará el día correcto automáticamente."""
+IMPORTANTE: En respuesta_texto NO incluyas fecha ni hora. Escribe únicamente
+el texto de confirmación sin mencionar ninguna fecha ni hora concreta, por ejemplo:
+"Estimado [nombre], gracias por contactarnos. Le confirmamos que su cita ha sido agendada
+en nuestra oficina. Si necesita realizar algún cambio o cancelación, no dude en hacérnoslo saber."
+El sistema insertará automáticamente la fecha y hora correctas."""
 
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -188,6 +191,14 @@ def analyze(subject, sender, body, retries=3, backoff=5):
     raise last_error
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+def fecha_legible(dt: datetime) -> str:
+    """Devuelve una fecha con día de la semana calculado por código, nunca por el LLM."""
+    return f"{DIAS[dt.weekday()]} {dt.strftime('%d/%m/%Y')} a las {dt.strftime('%H:%M')}"
+
+
 # ── Manejadores de cada acción ─────────────────────────────────────────────────
 def handle_agendar(svc, mid, tid, sender, subject, decision):
     """Agenda la cita en Calendar, guarda en Supabase y responde al cliente."""
@@ -221,14 +232,14 @@ def handle_agendar(svc, mid, tid, sender, subject, decision):
 
     event_id = agendar_cita(fecha_dt, sender, subject)
 
-    DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
-
     if event_id:
         guardar_cita(email=sender, event_id=event_id, fecha_cita=fecha_dt)
-        # Sustituir cualquier fecha en respuesta_texto por la versión con día correcto
-        fecha_correcta = f"{DIAS[fecha_dt.weekday()]} {fecha_dt.strftime('%d/%m/%Y')} a las {fecha_dt.strftime('%H:%M')}"
-        respuesta = respuesta.replace(fecha_dt.strftime("%d/%m/%Y"), fecha_correcta)
-        send_reply(svc, mid, tid, sender, subject, respuesta)
+        # La fecha siempre la añade el código, nunca el LLM
+        confirmacion = (
+            f"{respuesta.rstrip()}\n\n"
+            f"📅 Fecha confirmada: {fecha_legible(fecha_dt)}."
+        )
+        send_reply(svc, mid, tid, sender, subject, confirmacion)
         mark_read(svc, mid)
         logger.info(f"📅 Cita agendada y confirmada: {subject[:60]}")
     else:
@@ -238,14 +249,13 @@ def handle_agendar(svc, mid, tid, sender, subject, decision):
 
         if slots_libres:
             opciones_texto = "\n".join(
-                f"  • {DIAS[s.weekday()]} {s.strftime('%d/%m/%Y')} a las {s.strftime('%H:%M')}"
-                for s in slots_libres
+                f"  • {fecha_legible(s)}" for s in slots_libres
             )
             mensaje_ocupado = (
                 f"Hola,\n\n"
                 f"Gracias por contactarnos. Lamentablemente el horario solicitado "
-                f"({DIAS[fecha_dt.weekday()]} {fecha_dt.strftime('%d/%m/%Y')} a las {fecha_dt.strftime('%H:%M')}) "
-                f"no está disponible ya que tenemos otra cita en ese rango horario.\n\n"
+                f"({fecha_legible(fecha_dt)}) no está disponible "
+                f"ya que tenemos otra cita en ese rango horario.\n\n"
                 f"Te proponemos las siguientes fechas libres próximas:\n\n"
                 f"{opciones_texto}\n\n"
                 f"Confírmanos cuál de estas opciones te viene mejor y lo agendamos "
@@ -256,8 +266,8 @@ def handle_agendar(svc, mid, tid, sender, subject, decision):
             mensaje_ocupado = (
                 f"Hola,\n\n"
                 f"Gracias por contactarnos. Lamentablemente el horario solicitado "
-                f"({DIAS[fecha_dt.weekday()]} {fecha_dt.strftime('%d/%m/%Y')} a las {fecha_dt.strftime('%H:%M')}) "
-                f"no está disponible ya que tenemos otra cita en ese rango horario.\n\n"
+                f"({fecha_legible(fecha_dt)}) no está disponible "
+                f"ya que tenemos otra cita en ese rango horario.\n\n"
                 f"En este momento no encontramos huecos libres en los próximos días. "
                 f"Por favor, indícanos otro horario de tu preferencia y lo revisamos "
                 f"sin problema.\n\nRecuerda que atendemos de lunes a viernes de 9:30 a 17:00.\n\n"
