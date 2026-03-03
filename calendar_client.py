@@ -23,13 +23,10 @@ CALENDAR_SCOPES = [
 
 CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 EVENT_DURATION_MINUTES = int(os.environ.get("EVENT_DURATION_MINUTES", "60"))
+SLOT_BLOCK_HOURS = 2
 
 
 def get_calendar_service():
-    """
-    Reutiliza las credenciales OAuth2 de Gmail añadiendo el scope de Calendar.
-    Usa la misma variable de entorno GMAIL_CREDENTIALS_JSON.
-    """
     creds_data = json.loads(os.environ["GMAIL_CREDENTIALS_JSON"])
     creds = Credentials(
         token=creds_data.get("token"),
@@ -47,16 +44,40 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 
-def agendar_cita(fecha_hora: datetime, email_cliente: str, asunto_email: str) -> str | None:
-    """
-    Crea un evento en Google Calendar y devuelve el event_id.
-    Devuelve None si falla.
+def slot_disponible(fecha_hora: datetime) -> bool:
+    try:
+        svc = get_calendar_service()
 
-    Args:
-        fecha_hora: Datetime del inicio de la cita (sin timezone → se asume UTC).
-        email_cliente: Email del cliente para invitarlo al evento.
-        asunto_email: Asunto del email original (se usa como título del evento).
-    """
+        ventana_inicio = (fecha_hora - timedelta(hours=SLOT_BLOCK_HOURS)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        ventana_fin    = (fecha_hora + timedelta(hours=SLOT_BLOCK_HOURS)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+
+        eventos = svc.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=ventana_inicio,
+            timeMax=ventana_fin,
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+
+        conflictos = eventos.get("items", [])
+
+        if conflictos:
+            logger.warning(f"⛔ Slot ocupado: {len(conflictos)} evento(s) en el rango")
+            return False
+
+        logger.info(f"✅ Slot disponible para {fecha_hora}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error comprobando disponibilidad: {e}")
+        return False
+
+
+def agendar_cita(fecha_hora: datetime, email_cliente: str, asunto_email: str) -> str | None:
+    if not slot_disponible(fecha_hora):
+        logger.warning(f"⛔ No se puede agendar: slot ocupado en {fecha_hora}")
+        return None
+
     try:
         svc = get_calendar_service()
 
@@ -87,32 +108,28 @@ def agendar_cita(fecha_hora: datetime, email_cliente: str, asunto_email: str) ->
         resultado = svc.events().insert(
             calendarId=CALENDAR_ID,
             body=evento,
-            sendUpdates="all",  # Envía invitación al cliente
+            sendUpdates="all",
         ).execute()
 
         event_id = resultado.get("id")
-        logger.info(f"📅 Cita agendada en Calendar | event_id: {event_id} | {inicio}")
+        logger.info(f"📅 Cita agendada | event_id: {event_id} | {inicio}")
         return event_id
 
     except Exception as e:
-        logger.error(f"❌ Error agendando cita en Calendar: {e}")
+        logger.error(f"❌ Error agendando cita: {e}")
         return None
 
 
 def cancelar_cita(event_id: str) -> bool:
-    """
-    Elimina un evento de Google Calendar por su event_id.
-    Devuelve True si tuvo éxito, False si falló.
-    """
     try:
         svc = get_calendar_service()
         svc.events().delete(
             calendarId=CALENDAR_ID,
             eventId=event_id,
-            sendUpdates="all",  # Notifica al cliente de la cancelación
+            sendUpdates="all",
         ).execute()
-        logger.info(f"🗑️ Evento eliminado de Calendar | event_id: {event_id}")
+        logger.info(f"🗑️ Evento eliminado | event_id: {event_id}")
         return True
     except Exception as e:
-        logger.error(f"❌ Error cancelando cita en Calendar: {e}")
+        logger.error(f"❌ Error cancelando cita: {e}")
         return False
